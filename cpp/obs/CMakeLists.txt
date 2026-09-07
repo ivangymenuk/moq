@@ -71,10 +71,23 @@ if(_moq_local_build)
   target_link_libraries(obs-moq PRIVATE moq)
 else()
   include(FetchContent)
+  # Release archives are published to this repo's GitHub releases. Default to the
+  # upstream repo, but honour MOQ_RELEASE_REPO (or the GITHUB_REPOSITORY env set by
+  # CI) so a fork's release build fetches its OWN just-published libmoq archive
+  # instead of 404ing against upstream.
+  if(NOT MOQ_RELEASE_REPO)
+    if(DEFINED ENV{MOQ_RELEASE_REPO})
+      set(MOQ_RELEASE_REPO "$ENV{MOQ_RELEASE_REPO}")
+    elseif(DEFINED ENV{GITHUB_REPOSITORY})
+      set(MOQ_RELEASE_REPO "$ENV{GITHUB_REPOSITORY}")
+    else()
+      set(MOQ_RELEASE_REPO "moq-dev/moq")
+    endif()
+  endif()
   FetchContent_Declare(
     moq
     URL
-      https://github.com/moq-dev/moq/releases/download/libmoq-v${_moq_link_version}/moq-${_moq_link_version}-${MOQ_TARGET}.${MOQ_ARCHIVE}
+      https://github.com/${MOQ_RELEASE_REPO}/releases/download/libmoq-v${_moq_link_version}/moq-${_moq_link_version}-${MOQ_TARGET}.${MOQ_ARCHIVE}
   )
   FetchContent_MakeAvailable(moq)
 
