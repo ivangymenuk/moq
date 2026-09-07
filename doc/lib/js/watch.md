@@ -41,13 +41,80 @@ The overlay adds play/pause, volume, fullscreen, a quality selector, a
 buffering indicator, an unsupported-codec warning, and a stats panel.
 `<moq-watch-support>` shows what the browser can play.
 
+## Binding from a framework
+
+`import "@moq/watch/element"` registers `<moq-watch>` while the module
+evaluates, so a page that imports it at the top of a module always mounts an
+upgraded element. `el.broadcast`, `el.video`, `el.audio`, `el.sync`, and
+`el.signals` are assigned by the constructor and readable right away.
+
+Defer the import and that guarantee goes with it. A dynamic `import()` inside
+`onMount`, one behind a `browser` guard, or a `<script>` that loads after the
+markup all leave the tag unregistered until they land, and an element of an
+unregistered tag is a plain `HTMLElement`. A framework binding
+(Svelte's `bind:this`, React's `ref`) hands you that un-upgraded node, where
+every property reads `undefined`:
+
+```ts
+// TypeError: el.broadcast is undefined
+el.broadcast.out.catalog.subscribe(handler);
+```
+
+The browser upgrades the same node once the definition arrives, applying the
+attributes it already has, so the fix is to import the element statically or
+wait for the registration:
+
+```ts
+await customElements.whenDefined("moq-watch");
+el.broadcast.out.catalog.subscribe(handler);
+```
+
 ## Custom tracks
 
-`broadcast.subscribeTrack(name, priority, consume)` follows the active
-broadcast across reconnects for any application track, and the loose catalog
-passes your own sections through to `broadcast.catalog`. Decode JSON with
-`@moq/json`. Reach the pipeline from the element via `el.broadcast`,
-`el.video`, `el.audio`, and `el.signals`.
+The catalog schema is loose: sections `@moq/hang` doesn't recognize are passed
+through to `broadcast.out.catalog`, a read-only signal you react to like any
+other. Subscribe to the track it names off `broadcast.out.active`, the live
+broadcast consumer, and decode JSON with
+[`@moq/json`](https://www.npmjs.com/package/@moq/json).
+
+```ts
+import * as Json from "@moq/json";
+import { Hang } from "@moq/watch";
+
+const el = document.querySelector("moq-watch");
+
+// The element's own Effect, torn down with the element.
+el.signals.run((effect) => {
+    const catalog = effect.get(el.broadcast.out.catalog) as { metadata?: string[] } | undefined;
+    const active = effect.get(el.broadcast.out.active);
+
+    const name = catalog?.metadata?.[0];
+    if (!active || !name) return;
+
+    const track = active.track(name).subscribe({ priority: Hang.Catalog.PRIORITY.catalog });
+    effect.cleanup(() => track.close());
+
+    const consumer = new Json.Snapshot.Consumer<unknown>(track);
+    effect.spawn(async () => {
+        for (;;) {
+            const value = await Promise.race([effect.cancel, consumer.next()]);
+            if (value === undefined) break;
+            console.log("metadata", value);
+        }
+    });
+});
+```
+
+The effect re-runs whenever the catalog or the active broadcast changes, so a
+reconnect resubscribes on its own. A publisher that rewrites its catalog often
+(a live encoder tweak) re-runs it too; memoize the track name with
+`effect.computed` when that matters, as the
+[watch demo](https://github.com/moq-dev/moq/blob/main/demo/web/src/index.ts)
+does.
+
+`el.catalog` is the same value read once, without subscribing. Reach the rest
+of the pipeline through `el.broadcast`, `el.video`, `el.audio`, and
+`el.signals`.
 
 ## Without the element
 
