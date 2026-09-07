@@ -5108,6 +5108,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "futures",
+ "hang",
  "moq-mux",
  "moq-net",
  "srt-tokio",
