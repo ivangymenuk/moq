@@ -171,7 +171,6 @@ struct moq_source {
 	AVCodecContext *audio_codec_ctx;
 	uint32_t audio_sample_rate;
 	uint32_t audio_channels;
-	uint32_t audio_decode_errors;
 	uint64_t audio_frames_output;
 
 	// Decoder state
@@ -298,6 +297,8 @@ static void moq_source_blank_video(struct moq_source *ctx);
 static std::unique_ptr<prepared_decoder> moq_source_prepare_decoder(const struct moq_video_config *config);
 static void moq_source_install_decoder_locked(struct moq_source *ctx, std::unique_ptr<prepared_decoder> decoder);
 static void moq_source_destroy_decoder_locked(struct moq_source *ctx);
+static void moq_source_clear_video_locked(struct moq_source *ctx);
+static void moq_source_subscribe_video(struct moq_source *ctx, int32_t catalog, uint32_t current_gen);
 static std::unique_ptr<prepared_audio_decoder> moq_source_prepare_audio_decoder(const struct moq_audio_config *config);
 static void moq_source_install_audio_decoder_locked(struct moq_source *ctx,
 						    std::unique_ptr<prepared_audio_decoder> decoder);
@@ -334,7 +335,6 @@ static void *moq_source_create(obs_data_t *settings, obs_source_t *source)
 	ctx->audio_codec_ctx = NULL;
 	ctx->audio_sample_rate = 0;
 	ctx->audio_channels = 0;
-	ctx->audio_decode_errors = 0;
 	ctx->audio_frames_output = 0;
 	ctx->catalog_attempt = 0;
 	ctx->video_attempt = 0;
@@ -604,11 +604,26 @@ static void on_catalog(void *user_data, int32_t catalog)
 		moq_consume_catalog_free(catalog);
 		return;
 	}
-	// Get video configuration from the snapshot.
+	// Audio and video are independent catalog sections. Attempt both from this
+	// snapshot before freeing it, even when either rendition is absent or
+	// unsupported.
+	moq_source_subscribe_video(ctx, catalog, current_gen);
+	moq_source_subscribe_audio(ctx, catalog, current_gen);
+	moq_consume_catalog_free(catalog);
+}
+
+static void moq_source_subscribe_video(struct moq_source *ctx, int32_t catalog, uint32_t current_gen)
+{
 	struct moq_video_config video_config;
 	if (moq_consume_video_config(catalog, 0, &video_config) < 0) {
-		LOG_ERROR("Failed to get video config");
-		moq_consume_catalog_free(catalog);
+		LOG_INFO("Catalog has no video rendition; audio only");
+		pthread_mutex_lock(&ctx->mutex);
+		bool clear = ctx->generation == current_gen && !ctx->shutting_down.load() && ctx->consume >= 0;
+		if (clear)
+			moq_source_clear_video_locked(ctx);
+		pthread_mutex_unlock(&ctx->mutex);
+		if (clear)
+			moq_source_blank_video(ctx);
 		return;
 	}
 
@@ -617,7 +632,13 @@ static void on_catalog(void *user_data, int32_t catalog)
 	auto decoder = moq_source_prepare_decoder(&video_config);
 	if (!decoder) {
 		LOG_ERROR("Failed to initialize decoder");
-		moq_consume_catalog_free(catalog);
+		pthread_mutex_lock(&ctx->mutex);
+		bool clear = ctx->generation == current_gen && !ctx->shutting_down.load() && ctx->consume >= 0;
+		if (clear)
+			moq_source_clear_video_locked(ctx);
+		pthread_mutex_unlock(&ctx->mutex);
+		if (clear)
+			moq_source_blank_video(ctx);
 		return;
 	}
 	// Pre-account for the video track subscription before handing ctx to libmoq,
@@ -625,6 +646,10 @@ static void on_catalog(void *user_data, int32_t catalog)
 	// the next attempt without making it current until creation succeeds, so a
 	// rejected replacement does not invalidate the existing track.
 	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->generation != current_gen || ctx->shutting_down.load() || ctx->consume < 0) {
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
 	uint64_t video_attempt = ctx->video_attempt + 1;
 	ctx->refs++;
 	pthread_mutex_unlock(&ctx->mutex);
@@ -632,13 +657,8 @@ static void on_catalog(void *user_data, int32_t catalog)
 	auto *video_data = new callback_data{video_state};
 
 	// Subscribe to the video track (index 0). This takes the catalog snapshot,
-	// not the consume handle, and does not retain it - so free the snapshot
-	// immediately after.
+	// not the consume handle, and does not retain it.
 	int32_t track = moq_consume_video(catalog, 0, 0, on_video_frame, video_data);
-	// Audio rendition 0 (optional) from the SAME snapshot, before it is freed.
-	if (track >= 0)
-		moq_source_subscribe_audio(ctx, catalog, current_gen);
-	moq_consume_catalog_free(catalog);
 	if (track < 0) {
 		LOG_ERROR("Failed to subscribe to video track: %d", track);
 		delete video_data;
@@ -727,7 +747,7 @@ static void moq_source_subscribe_audio(struct moq_source *ctx, int32_t catalog, 
 	if (moq_consume_audio_config(catalog, 0, &audio_config) < 0) {
 		LOG_INFO("Catalog has no audio rendition; video only");
 		pthread_mutex_lock(&ctx->mutex);
-		if (ctx->generation == current_gen)
+		if (ctx->generation == current_gen && !ctx->shutting_down.load() && ctx->consume >= 0)
 			moq_source_clear_audio_locked(ctx);
 		pthread_mutex_unlock(&ctx->mutex);
 		return;
@@ -736,12 +756,16 @@ static void moq_source_subscribe_audio(struct moq_source *ctx, int32_t catalog, 
 	if (!decoder) {
 		LOG_ERROR("Failed to initialize audio decoder; stopping audio");
 		pthread_mutex_lock(&ctx->mutex);
-		if (ctx->generation == current_gen)
+		if (ctx->generation == current_gen && !ctx->shutting_down.load() && ctx->consume >= 0)
 			moq_source_clear_audio_locked(ctx);
 		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
 	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->generation != current_gen || ctx->shutting_down.load() || ctx->consume < 0) {
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
 	uint64_t audio_attempt = ctx->audio_attempt + 1;
 	ctx->refs++;
 	pthread_mutex_unlock(&ctx->mutex);
@@ -1122,18 +1146,25 @@ static void on_broadcast(void *user_data, int32_t broadcast)
 // never synchronously from within close(). That is what lets us close under the
 // mutex here without the terminal callback's subscription_ref re-entering the
 // mutex on this same thread (which would self-deadlock).
+static void moq_source_clear_video_locked(struct moq_source *ctx)
+{
+	ctx->video_attempt++;
+	if (ctx->video_track >= 0) {
+		moq_consume_video_close(ctx->video_track);
+		ctx->video_track = -1;
+	}
+	moq_source_destroy_decoder_locked(ctx);
+	ctx->got_keyframe = false;
+	ctx->frames_waiting_for_keyframe = 0;
+	ctx->consecutive_decode_errors = 0;
+}
+
 static void moq_source_disconnect_locked(struct moq_source *ctx)
 {
 	// Invalidate callbacks before closing their handles. A late terminal from an
 	// older subscription must not retire the replacement's handle.
 	ctx->catalog_attempt++;
-	ctx->video_attempt++;
-
-	if (ctx->video_track >= 0) {
-		moq_consume_video_close(ctx->video_track);
-		ctx->video_track = -1;
-	}
-
+	moq_source_clear_video_locked(ctx);
 	moq_source_clear_audio_locked(ctx);
 
 	if (ctx->catalog_handle >= 0) {
@@ -1163,11 +1194,6 @@ static void moq_source_disconnect_locked(struct moq_source *ctx)
 		moq_origin_close(ctx->origin);
 		ctx->origin = -1;
 	}
-
-	moq_source_destroy_decoder_locked(ctx);
-	ctx->got_keyframe = false;
-	ctx->frames_waiting_for_keyframe = 0;
-	ctx->consecutive_decode_errors = 0;
 }
 
 // Blanks the video preview by outputting a NULL frame
@@ -1590,7 +1616,6 @@ static void moq_source_install_audio_decoder_locked(struct moq_source *ctx,
 	decoder->codec_ctx = nullptr;
 	ctx->audio_sample_rate = decoder->sample_rate;
 	ctx->audio_channels = decoder->channels;
-	ctx->audio_decode_errors = 0;
 	ctx->audio_frames_output = 0;
 }
 
@@ -1629,12 +1654,15 @@ static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_
 	struct moq_frame frame_data;
 	if (moq_consume_frame(frame_id, &frame_data) < 0) {
 		LOG_ERROR("Failed to get audio frame data");
+		moq_source_clear_audio_locked(ctx);
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_free(frame_id);
 		return;
 	}
 	AVPacket *packet = av_packet_alloc();
 	if (!packet) {
+		LOG_ERROR("Failed to allocate audio packet");
+		moq_source_clear_audio_locked(ctx);
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_free(frame_id);
 		return;
@@ -1646,26 +1674,26 @@ static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_
 	int ret = avcodec_send_packet(ctx->audio_codec_ctx, packet);
 	av_packet_free(&packet);
 	if (ret < 0) {
-		ctx->audio_decode_errors++;
-		if (ctx->audio_decode_errors == 1 || (ctx->audio_decode_errors % 100) == 0)
-			LOG_WARNING("Audio decode error %d (count %u)", ret, ctx->audio_decode_errors);
+		LOG_ERROR("Failed to send audio packet to decoder: %d", ret);
+		moq_source_clear_audio_locked(ctx);
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_free(frame_id);
 		return;
 	}
 	AVFrame *frame = av_frame_alloc();
 	if (!frame) {
+		LOG_ERROR("Failed to allocate decoded audio frame");
+		moq_source_clear_audio_locked(ctx);
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_free(frame_id);
 		return;
 	}
-	while (avcodec_receive_frame(ctx->audio_codec_ctx, frame) == 0) {
+	while ((ret = avcodec_receive_frame(ctx->audio_codec_ctx, frame)) == 0) {
 		enum audio_format fmt = av_sample_fmt_to_obs(static_cast<enum AVSampleFormat>(frame->format));
 		int channels = frame->ch_layout.nb_channels;
 		enum speaker_layout speakers = audio_layout_to_speakers(&frame->ch_layout);
 		if (fmt == AUDIO_FORMAT_UNKNOWN || speakers == SPEAKERS_UNKNOWN || frame->sample_rate <= 0 ||
 		    frame->nb_samples <= 0) {
-			ctx->audio_decode_errors++;
 			LOG_ERROR("Unsupported decoded audio layout: fmt=%d channels=%d rate=%d", frame->format,
 				  channels, frame->sample_rate);
 			av_frame_unref(frame);
@@ -1689,6 +1717,10 @@ static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_
 			LOG_INFO("First audio frame output: %d samples, %d Hz, %d ch, fmt=%d", frame->nb_samples,
 				 frame->sample_rate, channels, frame->format);
 		av_frame_unref(frame);
+	}
+	if (ret != 0 && ret != AVERROR(EAGAIN)) {
+		LOG_ERROR("Failed to receive decoded audio frame: %d", ret);
+		moq_source_clear_audio_locked(ctx);
 	}
 	av_frame_free(&frame);
 	pthread_mutex_unlock(&ctx->mutex);

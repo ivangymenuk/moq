@@ -281,6 +281,8 @@ std::atomic<long> g_av_allocs{0};
 bool g_find_decoder_ok = true;
 int g_send_result = 0;
 int g_receive_result = 0;
+int g_audio_send_result = 0;
+int g_audio_receive_result = 0;
 int g_decoded_width = 320;
 int g_decoded_height = 240;
 enum AVSampleFormat g_decoded_audio_format = AV_SAMPLE_FMT_FLTP;
@@ -336,16 +338,19 @@ void avcodec_flush_buffers(AVCodecContext *) {}
 int avcodec_send_packet(AVCodecContext *ctx, const AVPacket *)
 {
 	g_last_decoder_extradata = ctx->extradata_size > 0 ? ctx->extradata[0] : -1;
-	if (ctx->codec_id == AV_CODEC_ID_AAC || ctx->codec_id == AV_CODEC_ID_OPUS)
+	if (ctx->codec_id == AV_CODEC_ID_AAC || ctx->codec_id == AV_CODEC_ID_OPUS) {
+		if (g_audio_send_result < 0)
+			return g_audio_send_result;
 		g_audio_frame_pending = true;
+	}
 	return g_send_result;
 }
 
 int avcodec_receive_frame(AVCodecContext *ctx, AVFrame *frame)
 {
-	if (g_receive_result < 0)
-		return g_receive_result;
 	if (ctx->codec_id == AV_CODEC_ID_AAC || ctx->codec_id == AV_CODEC_ID_OPUS) {
+		if (g_audio_receive_result < 0)
+			return g_audio_receive_result;
 		if (!g_audio_frame_pending)
 			return AVERROR(EAGAIN);
 		g_audio_frame_pending = false;
@@ -360,6 +365,8 @@ int avcodec_receive_frame(AVCodecContext *ctx, AVFrame *frame)
 			frame->data[i] = g_fake_plane;
 		return 0;
 	}
+	if (g_receive_result < 0)
+		return g_receive_result;
 
 	frame->format = AV_PIX_FMT_YUV420P;
 	frame->width = g_decoded_width;
@@ -1005,6 +1012,8 @@ void reset()
 	g_find_decoder_ok = true;
 	g_send_result = 0;
 	g_receive_result = 0;
+	g_audio_send_result = 0;
+	g_audio_receive_result = 0;
 	g_describe = false;
 	g_description[0] = 0x01;
 	g_decoded_width = 320;
@@ -1033,6 +1042,11 @@ void destroySource(void *source)
 	auto start = std::chrono::steady_clock::now();
 	g_info.destroy(source);
 	auto elapsed = std::chrono::steady_clock::now() - start;
+	// destroy returns after each terminal callback releases its source reference,
+	// just before the runtime marks that callback complete in the stub. Drain the
+	// runtime so the next scenario cannot clear the subscription table in that
+	// final bookkeeping window.
+	g_runtime->Run([] {});
 
 	// The destructor's backstop is two seconds. Landing anywhere near it means a
 	// terminal never arrived, so a reference was never released.
@@ -1255,6 +1269,49 @@ int main()
 		destroySource(source);
 	}
 	report("AAC and Opus frames output and freed");
+
+	// Audio is independent of video in the catalog. A source still subscribes
+	// and outputs audio when there is no video rendition.
+	{
+		reset();
+		g_video_config_result = -1;
+		g_audio_config_result = 0;
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+		CHECK(g_video_calls == 0);
+		CHECK(g_audio_calls == 1);
+
+		int32_t frame = newFrame(false);
+		g_runtime->Run([frame] { deliverStatus(g_last_audio, frame); });
+		CHECK(g_output_audio == 1);
+		CHECK(g_frame_frees == 1);
+
+		destroySource(source);
+	}
+	report("audio-only catalog remains playable");
+
+	// Malformed packets and fatal receive failures refuse the audio track instead
+	// of leaving a live subscription that silently drops every later frame.
+	for (bool fail_send : {true, false}) {
+		reset();
+		g_audio_config_result = 0;
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+		if (fail_send)
+			g_audio_send_result = -77;
+		else
+			g_audio_receive_result = -77;
+
+		int32_t frame = newFrame(false);
+		g_runtime->Run([frame] { deliverStatus(g_last_audio, frame); });
+		g_runtime->Run([] {});
+		CHECK(g_output_audio == 0);
+		CHECK(g_frame_frees == 1);
+		CHECK(g_audio_closes == 1);
+
+		destroySource(source);
+	}
+	report("fatal audio decode errors retire the track");
 
 	// If a later catalog's audio subscription fails, the existing track and its
 	// decoder remain current rather than leaving a live track with no decoder.
