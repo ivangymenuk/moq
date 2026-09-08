@@ -1270,6 +1270,26 @@ int main()
 	}
 	report("AAC and Opus frames output and freed");
 
+	// Without a decoder PTS, use the container frame timestamp and preserve the
+	// microseconds-to-nanoseconds conversion.
+	{
+		reset();
+		g_audio_config_result = 0;
+		g_decoded_audio_pts = AV_NOPTS_VALUE;
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+
+		int32_t frame = newFrame(false);
+		g_runtime->Run([frame] { deliverStatus(g_last_audio, frame); });
+		CHECK(g_output_audio == 1);
+		CHECK(g_last_audio_timestamp == 1000ull * static_cast<uint64_t>(frame) * 1000ull);
+		CHECK(g_audio_frame_unrefs == 1);
+		CHECK(g_frame_frees == 1);
+
+		destroySource(source);
+	}
+	report("audio without decoder PTS uses the frame timestamp");
+
 	// Audio is independent of video in the catalog. A source still subscribes
 	// and outputs audio when there is no video rendition.
 	{
