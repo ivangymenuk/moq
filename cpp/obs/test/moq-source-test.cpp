@@ -1329,9 +1329,11 @@ int main()
 
 		int32_t frame = newFrame(false);
 		g_runtime->Run([frame] { deliverStatus(g_last_audio, frame); });
+		g_runtime->Run([] {});
 		CHECK(g_output_audio == 0);
 		CHECK(g_audio_frame_unrefs == 1);
 		CHECK(g_frame_frees == 1);
+		CHECK(g_audio_closes == 1);
 
 		destroySource(source);
 	}

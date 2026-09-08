@@ -762,14 +762,15 @@ static void moq_source_subscribe_audio(struct moq_source *ctx, int32_t catalog, 
 	if (ctx->generation == current_gen && ctx->audio_attempt + 1 == audio_attempt && !ctx->shutting_down.load() &&
 	    !audio_state->terminal.load()) {
 		int32_t old_track = ctx->audio_track;
+		uint32_t sample_rate = decoder->sample_rate;
+		uint32_t channels = decoder->channels;
 		moq_source_install_audio_decoder_locked(ctx, std::move(decoder));
 		ctx->audio_attempt = audio_attempt;
 		ctx->audio_track = track;
 		pthread_mutex_unlock(&ctx->mutex);
 		if (old_track >= 0)
 			moq_consume_audio_close(old_track);
-		LOG_INFO("Subscribed to audio track successfully (%u Hz, %u ch)", ctx->audio_sample_rate,
-			 ctx->audio_channels);
+		LOG_INFO("Subscribed to audio track successfully (%u Hz, %u ch)", sample_rate, channels);
 	} else {
 		pthread_mutex_unlock(&ctx->mutex);
 		if (!audio_state->terminal.load())
@@ -1665,11 +1666,11 @@ static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_
 		if (fmt == AUDIO_FORMAT_UNKNOWN || speakers == SPEAKERS_UNKNOWN || frame->sample_rate <= 0 ||
 		    frame->nb_samples <= 0) {
 			ctx->audio_decode_errors++;
-			if (ctx->audio_decode_errors == 1)
-				LOG_WARNING("Unsupported decoded audio layout: fmt=%d channels=%d rate=%d",
-					    frame->format, channels, frame->sample_rate);
+			LOG_ERROR("Unsupported decoded audio layout: fmt=%d channels=%d rate=%d", frame->format,
+				  channels, frame->sample_rate);
 			av_frame_unref(frame);
-			continue;
+			moq_source_clear_audio_locked(ctx);
+			break;
 		}
 		struct obs_source_audio audio = {};
 		int planes = av_sample_fmt_is_planar(static_cast<enum AVSampleFormat>(frame->format)) ? channels : 1;
