@@ -289,8 +289,14 @@ enum AVSampleFormat g_decoded_audio_format = AV_SAMPLE_FMT_FLTP;
 int g_decoded_audio_samples = 960;
 int64_t g_decoded_audio_pts = AV_NOPTS_VALUE;
 int g_decoded_audio_channels = 2;
+enum AVChannelOrder g_decoded_audio_order = AV_CHANNEL_ORDER_NATIVE;
 uint64_t g_decoded_audio_layout = AV_CH_LAYOUT_STEREO;
 bool g_audio_frame_pending = false;
+bool g_audio_packet_owned = false;
+bool g_audio_packet_copied = false;
+bool g_audio_packet_padding_zero = false;
+const uint8_t *g_last_frame_payload = nullptr;
+size_t g_last_frame_payload_size = 0;
 std::atomic<int> g_last_decoder_extradata{-1};
 
 std::atomic<int> g_sws_scales{0};
@@ -335,10 +341,17 @@ int avcodec_open2(AVCodecContext *, const AVCodec *, AVDictionary **)
 
 void avcodec_flush_buffers(AVCodecContext *) {}
 
-int avcodec_send_packet(AVCodecContext *ctx, const AVPacket *)
+int avcodec_send_packet(AVCodecContext *ctx, const AVPacket *packet)
 {
 	g_last_decoder_extradata = ctx->extradata_size > 0 ? ctx->extradata[0] : -1;
 	if (ctx->codec_id == AV_CODEC_ID_AAC || ctx->codec_id == AV_CODEC_ID_OPUS) {
+		g_audio_packet_owned = packet->buf != nullptr;
+		g_audio_packet_copied = packet->data != g_last_frame_payload &&
+					packet->size == static_cast<int>(g_last_frame_payload_size) &&
+					memcmp(packet->data, g_last_frame_payload, g_last_frame_payload_size) == 0;
+		g_audio_packet_padding_zero = true;
+		for (int i = 0; i < AV_INPUT_BUFFER_PADDING_SIZE; i++)
+			g_audio_packet_padding_zero &= packet->data[packet->size + i] == 0;
 		if (g_audio_send_result < 0)
 			return g_audio_send_result;
 		g_audio_frame_pending = true;
@@ -358,7 +371,7 @@ int avcodec_receive_frame(AVCodecContext *ctx, AVFrame *frame)
 		frame->sample_rate = ctx->sample_rate;
 		frame->nb_samples = g_decoded_audio_samples;
 		frame->pts = g_decoded_audio_pts;
-		frame->ch_layout.order = AV_CHANNEL_ORDER_NATIVE;
+		frame->ch_layout.order = g_decoded_audio_order;
 		frame->ch_layout.nb_channels = g_decoded_audio_channels;
 		frame->ch_layout.u.mask = g_decoded_audio_layout;
 		for (int i = 0; i < frame->ch_layout.nb_channels; i++)
@@ -384,10 +397,27 @@ AVPacket *av_packet_alloc(void)
 	return static_cast<AVPacket *>(calloc(1, sizeof(AVPacket)));
 }
 
+int av_new_packet(AVPacket *pkt, int size)
+{
+	if (!pkt || size < 0)
+		return AVERROR(EINVAL);
+	pkt->data = static_cast<uint8_t *>(calloc(static_cast<size_t>(size) + AV_INPUT_BUFFER_PADDING_SIZE, 1));
+	if (!pkt->data)
+		return AVERROR(ENOMEM);
+	g_av_allocs++;
+	pkt->size = size;
+	pkt->buf = reinterpret_cast<AVBufferRef *>(pkt->data);
+	return 0;
+}
+
 void av_packet_free(AVPacket **pkt)
 {
 	if (!pkt || !*pkt)
 		return;
+	if ((*pkt)->buf) {
+		g_av_allocs--;
+		free((*pkt)->data);
+	}
 	g_av_allocs--;
 	free(*pkt);
 	*pkt = nullptr;
@@ -866,6 +896,8 @@ int32_t moq_consume_frame(uint32_t frame, struct moq_frame *dst)
 	}
 	dst->payload = g_description;
 	dst->payload_size = sizeof(g_description);
+	g_last_frame_payload = static_cast<const uint8_t *>(dst->payload);
+	g_last_frame_payload_size = dst->payload_size;
 	dst->timestamp_us = 1000 * static_cast<uint64_t>(frame);
 	dst->keyframe = it->second;
 	return 0;
@@ -1022,8 +1054,14 @@ void reset()
 	g_decoded_audio_samples = 960;
 	g_decoded_audio_pts = AV_NOPTS_VALUE;
 	g_decoded_audio_channels = 2;
+	g_decoded_audio_order = AV_CHANNEL_ORDER_NATIVE;
 	g_decoded_audio_layout = AV_CH_LAYOUT_STEREO;
 	g_audio_frame_pending = false;
+	g_audio_packet_owned = false;
+	g_audio_packet_copied = false;
+	g_audio_packet_padding_zero = false;
+	g_last_frame_payload = nullptr;
+	g_last_frame_payload_size = 0;
 	g_last_decoder_extradata = -1;
 	g_live_allocs = 0;
 	g_av_allocs = 0;
@@ -1265,6 +1303,9 @@ int main()
 		CHECK(g_last_audio_timestamp == 123456000);
 		CHECK(g_audio_frame_unrefs == 1);
 		CHECK(g_frame_frees == 1);
+		CHECK(g_audio_packet_owned);
+		CHECK(g_audio_packet_copied);
+		CHECK(g_audio_packet_padding_zero);
 
 		destroySource(source);
 	}
@@ -1394,13 +1435,23 @@ int main()
 	}
 	report("non-AAC mp4a object type is rejected");
 
-	// A three-channel surround frame is FL/FR/FC, not OBS 2.1 (FL/FR/LFE), so
-	// it must be rejected instead of silently sending dialogue to the subwoofer.
-	{
+	// OBS layouts imply exact speaker positions. Refuse non-native and mismatched
+	// masks instead of inferring mono, stereo, or 2.1 from channel count alone.
+	struct incompatible_layout {
+		int channels;
+		enum AVChannelOrder order;
+		uint64_t mask;
+	};
+	for (const auto &layout :
+	     {incompatible_layout{1, AV_CHANNEL_ORDER_NATIVE, AV_CH_FRONT_LEFT},
+	      incompatible_layout{2, AV_CHANNEL_ORDER_NATIVE, AV_CH_FRONT_LEFT | AV_CH_FRONT_CENTER},
+	      incompatible_layout{2, AV_CHANNEL_ORDER_UNSPEC, AV_CH_LAYOUT_STEREO},
+	      incompatible_layout{3, AV_CHANNEL_ORDER_NATIVE, AV_CH_LAYOUT_SURROUND}}) {
 		reset();
 		g_audio_config_result = 0;
-		g_decoded_audio_channels = 3;
-		g_decoded_audio_layout = AV_CH_LAYOUT_SURROUND;
+		g_decoded_audio_channels = layout.channels;
+		g_decoded_audio_order = layout.order;
+		g_decoded_audio_layout = layout.mask;
 		void *source = createSource();
 		subscribeVideo(newBroadcast());
 
@@ -1414,7 +1465,7 @@ int main()
 
 		destroySource(source);
 	}
-	report("incompatible channel layout is rejected");
+	report("incompatible channel layouts are rejected");
 
 	// The default: no audio rendition in the catalog. moq_consume_audio_config
 	// returns absent, and the source stays video-only with nothing subscribed or

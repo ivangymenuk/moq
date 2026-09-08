@@ -6,6 +6,7 @@
 #include <util/dstr.h>
 
 #include <atomic>
+#include <climits>
 #include <memory>
 #include <string>
 #include <errno.h>
@@ -107,24 +108,24 @@ static enum audio_format av_sample_fmt_to_obs(enum AVSampleFormat fmt)
 
 static enum speaker_layout audio_layout_to_speakers(const AVChannelLayout *layout)
 {
-	if (layout->nb_channels == 1)
-		return SPEAKERS_MONO;
-	if (layout->nb_channels == 2)
-		return SPEAKERS_STEREO;
 	if (layout->order != AV_CHANNEL_ORDER_NATIVE)
 		return SPEAKERS_UNKNOWN;
 
 	switch (layout->u.mask) {
+	case AV_CH_LAYOUT_MONO:
+		return layout->nb_channels == 1 ? SPEAKERS_MONO : SPEAKERS_UNKNOWN;
+	case AV_CH_LAYOUT_STEREO:
+		return layout->nb_channels == 2 ? SPEAKERS_STEREO : SPEAKERS_UNKNOWN;
 	case AV_CH_LAYOUT_2POINT1:
-		return SPEAKERS_2POINT1;
+		return layout->nb_channels == 3 ? SPEAKERS_2POINT1 : SPEAKERS_UNKNOWN;
 	case AV_CH_LAYOUT_4POINT0:
-		return SPEAKERS_4POINT0;
+		return layout->nb_channels == 4 ? SPEAKERS_4POINT0 : SPEAKERS_UNKNOWN;
 	case AV_CH_LAYOUT_4POINT1:
-		return SPEAKERS_4POINT1;
+		return layout->nb_channels == 5 ? SPEAKERS_4POINT1 : SPEAKERS_UNKNOWN;
 	case AV_CH_LAYOUT_5POINT1_BACK:
-		return SPEAKERS_5POINT1;
+		return layout->nb_channels == 6 ? SPEAKERS_5POINT1 : SPEAKERS_UNKNOWN;
 	case AV_CH_LAYOUT_7POINT1:
-		return SPEAKERS_7POINT1;
+		return layout->nb_channels == 8 ? SPEAKERS_7POINT1 : SPEAKERS_UNKNOWN;
 	default:
 		return SPEAKERS_UNKNOWN;
 	}
@@ -1659,16 +1660,24 @@ static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_
 		moq_consume_frame_free(frame_id);
 		return;
 	}
-	AVPacket *packet = av_packet_alloc();
-	if (!packet) {
-		LOG_ERROR("Failed to allocate audio packet");
+	if (frame_data.payload_size > INT_MAX) {
+		LOG_ERROR("Audio frame is too large to decode: %zu bytes", frame_data.payload_size);
 		moq_source_clear_audio_locked(ctx);
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_free(frame_id);
 		return;
 	}
-	packet->data = (uint8_t *)frame_data.payload;
-	packet->size = static_cast<int>(frame_data.payload_size);
+	AVPacket *packet = av_packet_alloc();
+	if (!packet || av_new_packet(packet, static_cast<int>(frame_data.payload_size)) < 0) {
+		LOG_ERROR("Failed to allocate audio packet");
+		av_packet_free(&packet);
+		moq_source_clear_audio_locked(ctx);
+		pthread_mutex_unlock(&ctx->mutex);
+		moq_consume_frame_free(frame_id);
+		return;
+	}
+	if (frame_data.payload_size > 0)
+		memcpy(packet->data, frame_data.payload, frame_data.payload_size);
 	packet->pts = static_cast<int64_t>(frame_data.timestamp_us);
 	packet->dts = packet->pts;
 	int ret = avcodec_send_packet(ctx->audio_codec_ctx, packet);
