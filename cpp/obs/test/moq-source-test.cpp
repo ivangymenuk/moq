@@ -165,6 +165,7 @@ std::atomic<uint64_t> g_last_timestamp{0};
 // PCM buffers the audio decode path handed to OBS.
 std::atomic<int> g_output_audio{0};
 std::atomic<uint64_t> g_last_audio_timestamp{0};
+std::atomic<int> g_audio_frame_unrefs{0};
 
 // The bmalloc/bfree balance. The source's whole teardown contract reduces to
 // this: ctx is freed only once every subscription has delivered its terminal, so
@@ -282,6 +283,12 @@ int g_send_result = 0;
 int g_receive_result = 0;
 int g_decoded_width = 320;
 int g_decoded_height = 240;
+enum AVSampleFormat g_decoded_audio_format = AV_SAMPLE_FMT_FLTP;
+int g_decoded_audio_samples = 960;
+int64_t g_decoded_audio_pts = AV_NOPTS_VALUE;
+int g_decoded_audio_channels = 2;
+uint64_t g_decoded_audio_layout = AV_CH_LAYOUT_STEREO;
+bool g_audio_frame_pending = false;
 std::atomic<int> g_last_decoder_extradata{-1};
 
 std::atomic<int> g_sws_scales{0};
@@ -294,13 +301,16 @@ extern "C" {
 
 const AVCodec *avcodec_find_decoder(enum AVCodecID id)
 {
+	g_fake_codec.id = id;
 	return (g_find_decoder_ok && id != AV_CODEC_ID_NONE) ? &g_fake_codec : nullptr;
 }
 
-AVCodecContext *avcodec_alloc_context3(const AVCodec *)
+AVCodecContext *avcodec_alloc_context3(const AVCodec *codec)
 {
 	g_av_allocs++;
-	return static_cast<AVCodecContext *>(calloc(1, sizeof(AVCodecContext)));
+	auto *ctx = static_cast<AVCodecContext *>(calloc(1, sizeof(AVCodecContext)));
+	ctx->codec_id = codec ? codec->id : AV_CODEC_ID_NONE;
+	return ctx;
 }
 
 void avcodec_free_context(AVCodecContext **avctx)
@@ -326,13 +336,30 @@ void avcodec_flush_buffers(AVCodecContext *) {}
 int avcodec_send_packet(AVCodecContext *ctx, const AVPacket *)
 {
 	g_last_decoder_extradata = ctx->extradata_size > 0 ? ctx->extradata[0] : -1;
+	if (ctx->codec_id == AV_CODEC_ID_AAC || ctx->codec_id == AV_CODEC_ID_OPUS)
+		g_audio_frame_pending = true;
 	return g_send_result;
 }
 
-int avcodec_receive_frame(AVCodecContext *, AVFrame *frame)
+int avcodec_receive_frame(AVCodecContext *ctx, AVFrame *frame)
 {
 	if (g_receive_result < 0)
 		return g_receive_result;
+	if (ctx->codec_id == AV_CODEC_ID_AAC || ctx->codec_id == AV_CODEC_ID_OPUS) {
+		if (!g_audio_frame_pending)
+			return AVERROR(EAGAIN);
+		g_audio_frame_pending = false;
+		frame->format = g_decoded_audio_format;
+		frame->sample_rate = ctx->sample_rate;
+		frame->nb_samples = g_decoded_audio_samples;
+		frame->pts = g_decoded_audio_pts;
+		frame->ch_layout.order = AV_CHANNEL_ORDER_NATIVE;
+		frame->ch_layout.nb_channels = g_decoded_audio_channels;
+		frame->ch_layout.u.mask = g_decoded_audio_layout;
+		for (int i = 0; i < frame->ch_layout.nb_channels; i++)
+			frame->data[i] = g_fake_plane;
+		return 0;
+	}
 
 	frame->format = AV_PIX_FMT_YUV420P;
 	frame->width = g_decoded_width;
@@ -374,7 +401,10 @@ void av_frame_free(AVFrame **frame)
 	*frame = nullptr;
 }
 
-void av_frame_unref(AVFrame *) {}
+void av_frame_unref(AVFrame *)
+{
+	g_audio_frame_unrefs++;
+}
 
 void av_channel_layout_default(AVChannelLayout *ch_layout, int nb_channels)
 {
@@ -521,7 +551,7 @@ int g_video_config_result = 0;
 // that wants the audio path sets g_audio_config_result = 0.
 int g_audio_result = 0;
 int g_audio_config_result = -1;
-const char g_audio_codec[] = "mp4a.40.2";
+std::string g_audio_codec = "mp4a.40.2";
 uint32_t g_audio_sample_rate = 48000;
 uint32_t g_audio_channels = 2;
 
@@ -784,8 +814,8 @@ int32_t moq_consume_audio_config(uint32_t catalog, uint32_t, struct moq_audio_co
 
 	dst->name = "audio";
 	dst->name_len = 5;
-	dst->codec = g_audio_codec;
-	dst->codec_len = sizeof(g_audio_codec) - 1;
+	dst->codec = g_audio_codec.data();
+	dst->codec_len = g_audio_codec.size();
 	dst->description = g_describe ? g_description : nullptr;
 	dst->description_len = g_describe ? sizeof(g_description) : 0;
 	dst->sample_rate = g_audio_sample_rate;
@@ -959,6 +989,7 @@ void reset()
 	g_output_frames = 0;
 	g_output_audio = 0;
 	g_last_audio_timestamp = 0;
+	g_audio_frame_unrefs = 0;
 	g_blank_calls = 0;
 	g_sws_scales = 0;
 	g_session_connect_early = false;
@@ -970,6 +1001,7 @@ void reset()
 	g_video_config_result = 0;
 	g_audio_result = 0;
 	g_audio_config_result = -1;
+	g_audio_codec = "mp4a.40.2";
 	g_find_decoder_ok = true;
 	g_send_result = 0;
 	g_receive_result = 0;
@@ -977,6 +1009,12 @@ void reset()
 	g_description[0] = 0x01;
 	g_decoded_width = 320;
 	g_decoded_height = 240;
+	g_decoded_audio_format = AV_SAMPLE_FMT_FLTP;
+	g_decoded_audio_samples = 960;
+	g_decoded_audio_pts = AV_NOPTS_VALUE;
+	g_decoded_audio_channels = 2;
+	g_decoded_audio_layout = AV_CH_LAYOUT_STEREO;
+	g_audio_frame_pending = false;
 	g_last_decoder_extradata = -1;
 	g_live_allocs = 0;
 	g_av_allocs = 0;
@@ -1196,6 +1234,108 @@ int main()
 		CHECK(g_audio_closes >= 1); // the audio track is closed on teardown
 	}
 	report("audio rendition subscribed alongside video");
+
+	// AAC and Opus frames are decoded, timestamped in OBS nanoseconds, and
+	// released after the synchronous OBS handoff.
+	for (const char *codec : {"mp4a.40.2", "opus"}) {
+		reset();
+		g_audio_config_result = 0;
+		g_audio_codec = codec;
+		g_decoded_audio_pts = 123456;
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+
+		int32_t frame = newFrame(false);
+		g_runtime->Run([frame] { deliverStatus(g_last_audio, frame); });
+		CHECK(g_output_audio == 1);
+		CHECK(g_last_audio_timestamp == 123456000);
+		CHECK(g_audio_frame_unrefs == 1);
+		CHECK(g_frame_frees == 1);
+
+		destroySource(source);
+	}
+	report("AAC and Opus frames output and freed");
+
+	// If a later catalog's audio subscription fails, the existing track and its
+	// decoder remain current rather than leaving a live track with no decoder.
+	{
+		reset();
+		g_audio_config_result = 0;
+		g_describe = true;
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+		int32_t first_audio = g_last_audio;
+
+		g_description[0] = 0x02;
+		g_audio_result = -77;
+		int32_t snapshot = newSnapshot();
+		g_runtime->Run([snapshot] { deliverStatus(g_last_catalog, snapshot); });
+		CHECK(g_audio_calls == 1);
+		CHECK(g_last_audio == first_audio);
+
+		int32_t frame = newFrame(false);
+		g_runtime->Run([first_audio, frame] { deliverStatus(first_audio, frame); });
+		CHECK(g_output_audio == 1);
+		CHECK(g_frame_frees == 1);
+		CHECK(g_last_decoder_extradata == 0x01);
+
+		destroySource(source);
+	}
+	report("failed audio replacement keeps the old track current");
+
+	// A video-only catalog update retires audio from the previous snapshot.
+	{
+		reset();
+		g_audio_config_result = 0;
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+		int32_t first_audio = g_last_audio;
+
+		g_audio_config_result = -1;
+		int32_t snapshot = newSnapshot();
+		g_runtime->Run([snapshot] { deliverStatus(g_last_catalog, snapshot); });
+		CHECK(g_audio_closes == 1);
+		g_runtime->Run([] {});
+		{
+			std::lock_guard<std::mutex> lock(g_subs_mutex);
+			CHECK(g_subs.at(first_audio).terminated);
+		}
+
+		destroySource(source);
+	}
+	report("video-only catalog update retires audio");
+
+	// Reject object types that use the mp4a namespace but are not an AAC profile.
+	{
+		reset();
+		g_audio_config_result = 0;
+		g_audio_codec = "mp4a.40.34";
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+		CHECK(g_audio_calls == 0);
+		destroySource(source);
+	}
+	report("non-AAC mp4a object type is rejected");
+
+	// A three-channel surround frame is FL/FR/FC, not OBS 2.1 (FL/FR/LFE), so
+	// it must be rejected instead of silently sending dialogue to the subwoofer.
+	{
+		reset();
+		g_audio_config_result = 0;
+		g_decoded_audio_channels = 3;
+		g_decoded_audio_layout = AV_CH_LAYOUT_SURROUND;
+		void *source = createSource();
+		subscribeVideo(newBroadcast());
+
+		int32_t frame = newFrame(false);
+		g_runtime->Run([frame] { deliverStatus(g_last_audio, frame); });
+		CHECK(g_output_audio == 0);
+		CHECK(g_audio_frame_unrefs == 1);
+		CHECK(g_frame_frees == 1);
+
+		destroySource(source);
+	}
+	report("incompatible channel layout is rejected");
 
 	// The default: no audio rendition in the catalog. moq_consume_audio_config
 	// returns absent, and the source stays video-only with nothing subscribed or

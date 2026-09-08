@@ -70,9 +70,11 @@ static AVCodecID audio_codec_string_to_id(const char *codec, size_t len)
 {
 	if (!codec || len == 0)
 		return AV_CODEC_ID_NONE;
-	if ((len >= 4 && strncasecmp(codec, "mp4a", 4) == 0) || (len >= 3 && strncasecmp(codec, "aac", 3) == 0))
+	if ((len == 3 && strncasecmp(codec, "aac", 3) == 0) ||
+	    (len == 9 && (strncasecmp(codec, "mp4a.40.2", 9) == 0 || strncasecmp(codec, "mp4a.40.5", 9) == 0)) ||
+	    (len == 10 && strncasecmp(codec, "mp4a.40.29", 10) == 0))
 		return AV_CODEC_ID_AAC;
-	if (len >= 4 && strncasecmp(codec, "opus", 4) == 0)
+	if (len == 4 && strncasecmp(codec, "opus", 4) == 0)
 		return AV_CODEC_ID_OPUS;
 	return AV_CODEC_ID_NONE;
 }
@@ -103,22 +105,25 @@ static enum audio_format av_sample_fmt_to_obs(enum AVSampleFormat fmt)
 	}
 }
 
-static enum speaker_layout channels_to_speakers(int channels)
+static enum speaker_layout audio_layout_to_speakers(const AVChannelLayout *layout)
 {
-	switch (channels) {
-	case 1:
+	if (layout->nb_channels == 1)
 		return SPEAKERS_MONO;
-	case 2:
+	if (layout->nb_channels == 2)
 		return SPEAKERS_STEREO;
-	case 3:
+	if (layout->order != AV_CHANNEL_ORDER_NATIVE)
+		return SPEAKERS_UNKNOWN;
+
+	switch (layout->u.mask) {
+	case AV_CH_LAYOUT_2POINT1:
 		return SPEAKERS_2POINT1;
-	case 4:
+	case AV_CH_LAYOUT_4POINT0:
 		return SPEAKERS_4POINT0;
-	case 5:
+	case AV_CH_LAYOUT_4POINT1:
 		return SPEAKERS_4POINT1;
-	case 6:
+	case AV_CH_LAYOUT_5POINT1_BACK:
 		return SPEAKERS_5POINT1;
-	case 8:
+	case AV_CH_LAYOUT_7POINT1:
 		return SPEAKERS_7POINT1;
 	default:
 		return SPEAKERS_UNKNOWN;
@@ -259,6 +264,18 @@ struct prepared_decoder {
 			avcodec_free_context(&codec_ctx);
 	}
 };
+
+struct prepared_audio_decoder {
+	AVCodecContext *codec_ctx = nullptr;
+	uint32_t sample_rate = 0;
+	uint32_t channels = 0;
+
+	~prepared_audio_decoder()
+	{
+		if (codec_ctx)
+			avcodec_free_context(&codec_ctx);
+	}
+};
 } // namespace
 
 // Forward declarations
@@ -281,8 +298,11 @@ static void moq_source_blank_video(struct moq_source *ctx);
 static std::unique_ptr<prepared_decoder> moq_source_prepare_decoder(const struct moq_video_config *config);
 static void moq_source_install_decoder_locked(struct moq_source *ctx, std::unique_ptr<prepared_decoder> decoder);
 static void moq_source_destroy_decoder_locked(struct moq_source *ctx);
-static bool moq_source_init_audio_decoder_locked(struct moq_source *ctx, const struct moq_audio_config *config);
+static std::unique_ptr<prepared_audio_decoder> moq_source_prepare_audio_decoder(const struct moq_audio_config *config);
+static void moq_source_install_audio_decoder_locked(struct moq_source *ctx,
+						    std::unique_ptr<prepared_audio_decoder> decoder);
 static void moq_source_destroy_audio_decoder_locked(struct moq_source *ctx);
+static void moq_source_clear_audio_locked(struct moq_source *ctx);
 static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_id);
 static void moq_source_subscribe_audio(struct moq_source *ctx, int32_t catalog, uint32_t current_gen);
 static void moq_source_decode_frame(struct moq_source *ctx, int32_t frame_id);
@@ -706,14 +726,22 @@ static void moq_source_subscribe_audio(struct moq_source *ctx, int32_t catalog, 
 	struct moq_audio_config audio_config;
 	if (moq_consume_audio_config(catalog, 0, &audio_config) < 0) {
 		LOG_INFO("Catalog has no audio rendition; video only");
+		pthread_mutex_lock(&ctx->mutex);
+		if (ctx->generation == current_gen)
+			moq_source_clear_audio_locked(ctx);
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+	auto decoder = moq_source_prepare_audio_decoder(&audio_config);
+	if (!decoder) {
+		LOG_ERROR("Failed to initialize audio decoder; stopping audio");
+		pthread_mutex_lock(&ctx->mutex);
+		if (ctx->generation == current_gen)
+			moq_source_clear_audio_locked(ctx);
+		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
 	pthread_mutex_lock(&ctx->mutex);
-	if (!moq_source_init_audio_decoder_locked(ctx, &audio_config)) {
-		pthread_mutex_unlock(&ctx->mutex);
-		LOG_ERROR("Failed to initialize audio decoder; continuing video only");
-		return;
-	}
 	uint64_t audio_attempt = ctx->audio_attempt + 1;
 	ctx->refs++;
 	pthread_mutex_unlock(&ctx->mutex);
@@ -725,7 +753,6 @@ static void moq_source_subscribe_audio(struct moq_source *ctx, int32_t catalog, 
 		LOG_ERROR("Failed to subscribe to audio track: %d", track);
 		delete audio_data;
 		pthread_mutex_lock(&ctx->mutex);
-		moq_source_destroy_audio_decoder_locked(ctx);
 		if (--ctx->refs == 0)
 			pthread_cond_broadcast(&ctx->refs_zero);
 		pthread_mutex_unlock(&ctx->mutex);
@@ -735,6 +762,7 @@ static void moq_source_subscribe_audio(struct moq_source *ctx, int32_t catalog, 
 	if (ctx->generation == current_gen && ctx->audio_attempt + 1 == audio_attempt && !ctx->shutting_down.load() &&
 	    !audio_state->terminal.load()) {
 		int32_t old_track = ctx->audio_track;
+		moq_source_install_audio_decoder_locked(ctx, std::move(decoder));
 		ctx->audio_attempt = audio_attempt;
 		ctx->audio_track = track;
 		pthread_mutex_unlock(&ctx->mutex);
@@ -1099,17 +1127,13 @@ static void moq_source_disconnect_locked(struct moq_source *ctx)
 	// older subscription must not retire the replacement's handle.
 	ctx->catalog_attempt++;
 	ctx->video_attempt++;
-	ctx->audio_attempt++;
 
 	if (ctx->video_track >= 0) {
 		moq_consume_video_close(ctx->video_track);
 		ctx->video_track = -1;
 	}
 
-	if (ctx->audio_track >= 0) {
-		moq_consume_audio_close(ctx->audio_track);
-		ctx->audio_track = -1;
-	}
+	moq_source_clear_audio_locked(ctx);
 
 	if (ctx->catalog_handle >= 0) {
 		moq_consume_catalog_close(ctx->catalog_handle);
@@ -1140,7 +1164,6 @@ static void moq_source_disconnect_locked(struct moq_source *ctx)
 	}
 
 	moq_source_destroy_decoder_locked(ctx);
-	moq_source_destroy_audio_decoder_locked(ctx);
 	ctx->got_keyframe = false;
 	ctx->frames_waiting_for_keyframe = 0;
 	ctx->consecutive_decode_errors = 0;
@@ -1515,8 +1538,7 @@ static void moq_source_decode_frame(struct moq_source *ctx, int32_t frame_id)
 }
 
 // ---- Audio -------------------------------------------------------------------
-// NOTE: caller holds ctx->mutex.
-static bool moq_source_init_audio_decoder_locked(struct moq_source *ctx, const struct moq_audio_config *config)
+static std::unique_ptr<prepared_audio_decoder> moq_source_prepare_audio_decoder(const struct moq_audio_config *config)
 {
 	AVCodecID codec_id = audio_codec_string_to_id(config->codec, config->codec_len);
 	if (codec_id == AV_CODEC_ID_NONE) {
@@ -1525,40 +1547,50 @@ static bool moq_source_init_audio_decoder_locked(struct moq_source *ctx, const s
 		if (config->codec && n > 0)
 			memcpy(codec_str, config->codec, n);
 		LOG_ERROR("Unknown or unsupported audio codec: '%s'", codec_str);
-		return false;
+		return nullptr;
 	}
 	const AVCodec *codec = avcodec_find_decoder(codec_id);
 	if (!codec) {
 		LOG_ERROR("Audio decoder not found for codec ID: %d", codec_id);
-		return false;
+		return nullptr;
 	}
-	AVCodecContext *cctx = avcodec_alloc_context3(codec);
-	if (!cctx) {
+	auto decoder = std::make_unique<prepared_audio_decoder>();
+	decoder->codec_ctx = avcodec_alloc_context3(codec);
+	if (!decoder->codec_ctx) {
 		LOG_ERROR("Failed to allocate audio codec context");
-		return false;
+		return nullptr;
 	}
-	cctx->sample_rate = static_cast<int>(config->sample_rate);
-	av_channel_layout_default(&cctx->ch_layout, static_cast<int>(config->channel_count));
-	cctx->pkt_timebase = AVRational{1, 1000000}; // libmoq frame timestamps are microseconds
+	decoder->sample_rate = config->sample_rate;
+	decoder->channels = config->channel_count;
+	decoder->codec_ctx->sample_rate = static_cast<int>(config->sample_rate);
+	av_channel_layout_default(&decoder->codec_ctx->ch_layout, static_cast<int>(config->channel_count));
+	decoder->codec_ctx->pkt_timebase = AVRational{1, 1000000}; // libmoq frame timestamps are microseconds
 	if (config->description && config->description_len > 0) {
-		cctx->extradata = (uint8_t *)av_mallocz(config->description_len + AV_INPUT_BUFFER_PADDING_SIZE);
-		if (cctx->extradata) {
-			memcpy(cctx->extradata, config->description, config->description_len);
-			cctx->extradata_size = static_cast<int>(config->description_len);
+		decoder->codec_ctx->extradata =
+			(uint8_t *)av_mallocz(config->description_len + AV_INPUT_BUFFER_PADDING_SIZE);
+		if (decoder->codec_ctx->extradata) {
+			memcpy(decoder->codec_ctx->extradata, config->description, config->description_len);
+			decoder->codec_ctx->extradata_size = static_cast<int>(config->description_len);
 		}
 	}
-	if (avcodec_open2(cctx, codec, NULL) < 0) {
+	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
 		LOG_ERROR("Failed to open audio codec");
-		avcodec_free_context(&cctx);
-		return false;
+		return nullptr;
 	}
+	return decoder;
+}
+
+// NOTE: caller holds ctx->mutex.
+static void moq_source_install_audio_decoder_locked(struct moq_source *ctx,
+						    std::unique_ptr<prepared_audio_decoder> decoder)
+{
 	moq_source_destroy_audio_decoder_locked(ctx);
-	ctx->audio_codec_ctx = cctx;
-	ctx->audio_sample_rate = config->sample_rate;
-	ctx->audio_channels = config->channel_count;
+	ctx->audio_codec_ctx = decoder->codec_ctx;
+	decoder->codec_ctx = nullptr;
+	ctx->audio_sample_rate = decoder->sample_rate;
+	ctx->audio_channels = decoder->channels;
 	ctx->audio_decode_errors = 0;
 	ctx->audio_frames_output = 0;
-	return true;
 }
 
 // NOTE: caller holds ctx->mutex.
@@ -1568,6 +1600,17 @@ static void moq_source_destroy_audio_decoder_locked(struct moq_source *ctx)
 		avcodec_free_context(&ctx->audio_codec_ctx);
 	ctx->audio_sample_rate = 0;
 	ctx->audio_channels = 0;
+}
+
+// NOTE: caller holds ctx->mutex.
+static void moq_source_clear_audio_locked(struct moq_source *ctx)
+{
+	ctx->audio_attempt++;
+	if (ctx->audio_track >= 0) {
+		moq_consume_audio_close(ctx->audio_track);
+		ctx->audio_track = -1;
+	}
+	moq_source_destroy_audio_decoder_locked(ctx);
 }
 
 static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_id)
@@ -1618,7 +1661,7 @@ static void moq_source_decode_audio_frame(struct moq_source *ctx, int32_t frame_
 	while (avcodec_receive_frame(ctx->audio_codec_ctx, frame) == 0) {
 		enum audio_format fmt = av_sample_fmt_to_obs(static_cast<enum AVSampleFormat>(frame->format));
 		int channels = frame->ch_layout.nb_channels;
-		enum speaker_layout speakers = channels_to_speakers(channels);
+		enum speaker_layout speakers = audio_layout_to_speakers(&frame->ch_layout);
 		if (fmt == AUDIO_FORMAT_UNKNOWN || speakers == SPEAKERS_UNKNOWN || frame->sample_rate <= 0 ||
 		    frame->nb_samples <= 0) {
 			ctx->audio_decode_errors++;
